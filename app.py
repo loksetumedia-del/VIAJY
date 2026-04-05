@@ -1,119 +1,160 @@
 """
-app.py  —  Hugging Face Space for GridWorld-v1 OpenEnv
-======================================================
-This Space hosts the environment and exposes a Gradio UI
-so evaluators can run the agent interactively.
+app.py — OpenEnv FastAPI Server
+================================
+Exposes the GridWorld-v1 environment via HTTP REST API:
+  POST /reset        → resets env, returns initial observation
+  POST /step         → takes action, returns (obs, reward, done, info)
+  GET  /state        → returns full environment state
+  GET  /             → health check
+
+The checker calls POST /reset first — this MUST work.
 """
 
-import gradio as gr
-import json
-import sys
 import os
+import sys
+import json
+import time
+import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(__file__))
 from env import make
-from inference import run_episode, _greedy_action, llm_select_action
 
-# ── Helper: render grid as HTML ───────────────────────────────────────────────
+# ── Logging (START/STEP/END format) ───────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def render_html(env_obj, last_reward=None, last_event=None):
-    s    = env_obj.state()
-    ag   = s["agent_pos"]
-    goal = s["goal_pos"]
-    haz  = set(map(tuple, s["hazards"]))
-    n    = s["grid_size"]
+def log_event(event_type: str, data: dict):
+    payload = {"type": event_type, "timestamp": time.time(), **data}
+    print(json.dumps(payload), flush=True)
 
-    cells = ""
-    for r in range(n):
-        cells += "<tr>"
-        for c in range(n):
-            pos = (r, c)
-            if pos == ag:
-                bg, txt = "#185FA5", "A"
-            elif pos == goal:
-                bg, txt = "#3B6D11", "G"
-            elif pos in haz:
-                bg, txt = "#A32D2D", "X"
-            else:
-                bg, txt = "#2a2a2a", "·"
-            cells += f'<td style="width:60px;height:60px;text-align:center;font-size:22px;font-weight:bold;color:white;background:{bg};border-radius:6px;border:2px solid #111">{txt}</td>'
-        cells += "</tr>"
+# ── FastAPI app ────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="GridWorld-v1 OpenEnv",
+    description="A 5x5 grid navigation environment implementing the OpenEnv API.",
+    version="1.0.0",
+)
 
-    reward_info = ""
-    if last_reward is not None:
-        color = "lightgreen" if last_reward > 0 else ("tomato" if last_reward < -0.5 else "orange")
-        reward_info = f'<p style="color:{color};font-family:monospace">Last reward: {last_reward}  |  Event: {last_event}</p>'
+# Global env instance (single-session)
+_env = make("GridWorld-v1")
+_env.reset()
 
-    return f"""
-    <div style="font-family:monospace;background:#111;padding:16px;border-radius:8px;display:inline-block">
-      <p style="color:#aaa;margin:0 0 8px">GridWorld-v1 — Step {s['steps']}/{s['max_steps']} | Cum. reward: {s['cumulative_reward']}</p>
-      <table style="border-collapse:separate;border-spacing:4px">{cells}</table>
-      {reward_info}
-    </div>
+# ── Request models ─────────────────────────────────────────────────────────────
+class StepRequest(BaseModel):
+    action: int  # 0=Up, 1=Right, 2=Down, 3=Left
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def health():
+    """Health check."""
+    return {"status": "ok", "env": "GridWorld-v1", "version": "1.0.0"}
+
+
+@app.post("/reset")
+def reset():
     """
+    Reset the environment to its initial state.
+    Returns the initial observation.
+    """
+    global _env
+    _env = make("GridWorld-v1")
+    obs = _env.reset()
+    state = _env.state()
+
+    log_event("START", {
+        "env_id": "GridWorld-v1",
+        "config": {
+            "grid_size": state["grid_size"],
+            "max_steps": state["max_steps"],
+            "goal_pos": list(state["goal_pos"]),
+            "hazards": [list(h) for h in state["hazards"]],
+        }
+    })
+
+    return {
+        "observation": list(obs),
+        "state": {
+            "agent_pos": list(state["agent_pos"]),
+            "goal_pos": list(state["goal_pos"]),
+            "hazards": [list(h) for h in state["hazards"]],
+            "grid_size": state["grid_size"],
+            "steps": state["steps"],
+            "max_steps": state["max_steps"],
+            "done": state["done"],
+            "cumulative_reward": state["cumulative_reward"],
+        }
+    }
 
 
-# ── Gradio state ──────────────────────────────────────────────────────────────
-_env = [make()]
+@app.post("/step")
+def step(body: StepRequest):
+    """
+    Take one step in the environment.
+    action: 0=Up, 1=Right, 2=Down, 3=Left
+    """
+    if body.action not in (0, 1, 2, 3):
+        raise HTTPException(status_code=400, detail=f"Invalid action {body.action}. Must be 0-3.")
 
-def reset_env():
-    _env[0] = make()
-    _env[0].reset()
-    return render_html(_env[0]), "Episode reset! Use buttons or auto-run.", ""
+    if _env.state()["done"]:
+        raise HTTPException(status_code=400, detail="Episode is done. Call /reset first.")
 
-def step_action(action_idx):
-    env = _env[0]
-    if env.state()["done"]:
-        return render_html(env), "Episode done — press Reset!", ""
-    obs, reward, done, info = env.step(int(action_idx))
-    msg = f"Action: {info['action_name']} | Event: {info['event']}"
-    log = json.dumps({"type":"STEP","step":info["steps"],"obs":list(obs),"reward":reward,"done":done}, indent=2)
-    return render_html(env, reward, info["event"]), msg, log
+    obs, reward, done, info = _env.step(body.action)
 
-def auto_run():
-    env  = _env[0]
-    if env.state()["done"]:
-        env.reset()
-    logs = []
-    while not env.state()["done"]:
-        s  = env.state()
-        a  = _greedy_action(s["agent_pos"], s["goal_pos"], s["hazards"])
-        obs, reward, done, info = env.step(a)
-        logs.append(json.dumps({"step":info["steps"],"action":info["action_name"],"reward":reward,"done":done}))
-    s   = env.state()
-    msg = "✅ Goal reached!" if s["agent_pos"] == s["goal_pos"] else "❌ Timeout"
-    return render_html(env), msg, "\n".join(logs)
+    log_event("STEP", {
+        "step": info["steps"],
+        "action": body.action,
+        "obs": list(obs),
+        "reward": reward,
+        "done": done,
+        "info": info,
+    })
+
+    if done:
+        success = (tuple(obs) == tuple(_env.state()["goal_pos"]))
+        log_event("END", {
+            "total_reward": _env.state()["cumulative_reward"],
+            "total_steps": info["steps"],
+            "success": success,
+            "message": "Goal reached!" if success else "Episode ended.",
+        })
+
+    return {
+        "observation": list(obs),
+        "reward": reward,
+        "done": done,
+        "info": info,
+    }
 
 
-# ── Gradio UI ─────────────────────────────────────────────────────────────────
-with gr.Blocks(title="GridWorld-v1 OpenEnv", theme=gr.themes.Monochrome()) as demo:
-    gr.Markdown("# 🤖 GridWorld-v1 — OpenEnv\n**A=Agent · G=Goal · X=Hazard**  |  Actions: ↑↓←→")
+@app.get("/state")
+def state():
+    """Return the full current state of the environment."""
+    s = _env.state()
+    return {
+        "agent_pos": list(s["agent_pos"]),
+        "goal_pos": list(s["goal_pos"]),
+        "hazards": [list(h) for h in s["hazards"]],
+        "grid_size": s["grid_size"],
+        "steps": s["steps"],
+        "max_steps": s["max_steps"],
+        "done": s["done"],
+        "cumulative_reward": s["cumulative_reward"],
+        "action_space": s["action_space"],
+        "obs_space": list(s["obs_space"]),
+    }
 
-    with gr.Row():
-        with gr.Column(scale=2):
-            grid_html = gr.HTML(label="Environment")
-        with gr.Column(scale=1):
-            status = gr.Textbox(label="Status", interactive=False)
-            log_out = gr.Textbox(label="Step log (JSON)", lines=8, interactive=False)
 
-    with gr.Row():
-        btn_up    = gr.Button("↑ Up")
-        btn_down  = gr.Button("↓ Down")
-        btn_left  = gr.Button("← Left")
-        btn_right = gr.Button("→ Right")
+@app.get("/render")
+def render():
+    """Return ASCII render of the current grid."""
+    return {"render": _env.render()}
 
-    with gr.Row():
-        btn_reset = gr.Button("🔄 Reset", variant="secondary")
-        btn_auto  = gr.Button("▶ Auto Run (Greedy)", variant="primary")
 
-    btn_up.click   (lambda: step_action(0), outputs=[grid_html, status, log_out])
-    btn_right.click(lambda: step_action(1), outputs=[grid_html, status, log_out])
-    btn_down.click (lambda: step_action(2), outputs=[grid_html, status, log_out])
-    btn_left.click (lambda: step_action(3), outputs=[grid_html, status, log_out])
-    btn_reset.click(reset_env,              outputs=[grid_html, status, log_out])
-    btn_auto.click (auto_run,               outputs=[grid_html, status, log_out])
-
-    demo.load(reset_env, outputs=[grid_html, status, log_out])
-
+# ── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    demo.launch()
+    import uvicorn
+    port = int(os.getenv("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)
